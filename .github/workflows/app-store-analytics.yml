@@ -1,0 +1,172 @@
+name: App Store analytics reports
+'on':
+  workflow_dispatch:
+    inputs:
+      report_end:
+        description: Last event date (YYYY-MM-DD); blank = yesterday, Asia/Shanghai
+        required: false
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: app-store-analytics-reports
+  cancel-in-progress: false
+jobs:
+  reports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install report dependencies
+      run: python -m pip install "PyJWT[crypto]==2.10.1" "requests==2.32.5"
+    - name: Fetch Apple analytics reports
+      env:
+        ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        ASC_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        REPORT_END: ${{ inputs.report_end }}
+      run: |
+        python - <<'PYTHON'
+        import base64
+        import datetime as dt
+        import gzip
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import time
+        from urllib.parse import urlparse
+
+        import jwt
+        import requests
+
+        OUT = Path('asc-reports')
+        OUT.mkdir(exist_ok=True)
+        API = 'https://api.appstoreconnect.apple.com'
+
+        def api(path, method='GET', payload=None):
+            url = path if path.startswith('https://') else API + path
+            if urlparse(url).netloc != 'api.appstoreconnect.apple.com':
+                raise RuntimeError('Unexpected API pagination host')
+            now = int(time.time())
+            token = jwt.encode({'iss': os.environ['ASC_ISSUER_ID'], 'iat': now,
+                                'exp': now + 600, 'aud': 'appstoreconnect-v1'},
+                               base64.b64decode(os.environ['ASC_PRIVATE_KEY_BASE64']),
+                               algorithm='ES256', headers={'kid': os.environ['ASC_KEY_ID']})
+            for attempt in range(4):
+                response = requests.request(method, url, json=payload,
+                            headers={'Authorization': 'Bearer ' + token}, timeout=60)
+                if response.status_code == 429 or response.status_code >= 500:
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+            if not response.ok:
+                # Never print tokens, private keys, signed download URLs, or response bodies.
+                raise RuntimeError(f'Apple API {method} {urlparse(url).path}: HTTP {response.status_code}. '
+                                   '403: check the key role and app access; 401: check existing key configuration.')
+            return response.json()
+
+        def listing(path):
+            while path:
+                page = api(path)
+                yield from page.get('data', [])
+                path = page.get('links', {}).get('next')
+
+        def main():
+            for key in ('ASC_KEY_ID', 'ASC_ISSUER_ID', 'ASC_PRIVATE_KEY_BASE64'):
+                if not os.environ.get(key):
+                    raise RuntimeError(f'Missing {key}; check organization secret repository access')
+            apps = list(listing('/v1/apps?filter[bundleId]=com.luolihao.musicalsystem'))
+            if len(apps) != 1:
+                raise RuntimeError('Expected exactly one app for com.luolihao.musicalsystem')
+            app = apps[0]
+            today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
+            end_text = os.environ.get('REPORT_END', '').strip()
+            end = dt.date.fromisoformat(end_text) if end_text else today - dt.timedelta(days=1)
+            start = end - dt.timedelta(days=13)
+            manifest = {'app_id': app['id'], 'app_name': app['attributes']['name'],
+                        'requested_event_dates': [str(start), str(end)],
+                        'created_at_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+                        'note': 'Raw Apple daily instances. Processing dates are not event dates. '
+                                'Do not sum overlapping instances or Standard and Detailed variants. '
+                                'Missing/suppressed/unavailable data is not zero. Revenue requires a separate Sales report.',
+                        'files': []}
+            reqs = list(listing(f"/v1/apps/{app['id']}/analyticsReportRequests"))
+            snapshots = [r for r in reqs if r['attributes']['accessType'] == 'ONE_TIME_SNAPSHOT']
+            if not snapshots:
+                request = api('/v1/analyticsReportRequests', 'POST', {'data': {
+                    'type': 'analyticsReportRequests', 'attributes': {'accessType': 'ONE_TIME_SNAPSHOT'},
+                    'relationships': {'app': {'data': {'type': 'apps', 'id': app['id']}}}}})['data']
+                reqs.append(request)
+                manifest['snapshot_requested'] = True
+            seen = set()
+            for request in reqs:
+                for report in listing(f"/v1/analyticsReportRequests/{request['id']}/reports"):
+                    name = report['attributes']['name']
+                    if not any(term in name.lower() for term in ('discovery', 'engagement', 'download', 'purchase')):
+                        continue
+                    for instance in listing(f"/v1/analyticsReports/{report['id']}/instances?filter[granularity]=DAILY&limit=200"):
+                        processing = instance['attributes']['processingDate']
+                        # Keep later processing dates too: they can revise earlier event dates.
+                        if processing < str(start):
+                            continue
+                        for segment in listing(f"/v1/analyticsReportInstances/{instance['id']}/segments"):
+                            if segment['id'] in seen:
+                                continue
+                            seen.add(segment['id'])
+                            download_url = segment['attributes']['url']
+                            if urlparse(download_url).scheme != 'https':
+                                raise RuntimeError('Report download requires HTTPS')
+                            try:
+                                response = requests.get(download_url, timeout=120)
+                                if not response.ok:
+                                    raise RuntimeError('download failed')
+                            except requests.RequestException:
+                                raise RuntimeError('Report download failed; rerun to refresh signed URLs') from None
+                            content = response.content
+                            if content[:2] == b'\x1f\x8b':
+                                content = gzip.decompress(content)
+                            content.decode('utf-8-sig')
+                            safe = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+                            filename = f"{safe}_{processing}_{segment['id']}.tsv"
+                            (OUT / filename).write_bytes(content)
+                            manifest['files'].append({'file': filename, 'report': name,
+                                'request_id': request['id'], 'instance_id': instance['id'],
+                                'processing_date': processing})
+            (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+            count = len(manifest['files'])
+            status = f'Downloaded {count} raw report segments.' if count else 'WAITING: Apple has not supplied matching reports yet. This does not mean zero downloads.'
+            summary = f"App: {manifest['app_name']} ({app['id']})\n\nRequested event-date window: {start} to {end}. Last 7 days plus previous 7 days.\n\n{status}\n\n{manifest['note']}\n"
+            (OUT / 'README.txt').write_text(summary)
+            print('Apple report request completed. Results are available only in the encrypted artifact.')
+
+
+
+        main()
+        PUBLIC_KEY = '-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAhcE4wi+fYXgqNkcGIUEM\nwZBbTnUatJje8HduMR/mHc2c08B1yNeboozOlBx+CrYruEssUAAAMYTgcHw1wOoJ\n3YyAfOJ5oUsodsfs+vnACSCzxm+/uEenlHEVaXTN8DfHBMxt71G3mcb3mss6nFrX\nAU8+L44te91FgEKl9qNZFE8EfVloXoerCtMMZdaOl7vJdP8foR1yyn8rEOi2H4BK\n1Q4cwxZEcrGN5bsbxnILDkPKcJ6jYUAGUcdSKcujAAHlNRhNgDPoN2eNTnbnhZo+\nccSvbkKw8awHkRhfVnjqHrY2wnpTJpos7dEYqcf/PiIO9TSpFjTFjAPmoNHLtXi0\nGYYV+yOQ9JdmK0+eUZ1X+oOHiQIj3ttvkDv01sqPmS6llnNbvZD9JsqiL+BPhRlO\n6YC+b2wMrlbTUfyz3HDLbdvPpEWaSm1YJHKhwOCLfK4JzbJhvTN/zcvpw2egixJq\n+t4hAsijRRwDj/pdWHfbSFU1BphdKw20Rjk9fgFBqkjvAgMBAAE=\n-----END PUBLIC KEY-----\n'
+
+        import io, tarfile, secrets
+        from cryptography.hazmat.primitives import serialization, hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        public_key = serialization.load_pem_public_key(PUBLIC_KEY.encode())
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w:gz') as archive:
+            archive.add(OUT, arcname='asc-reports')
+        aes_key = AESGCM.generate_key(bit_length=256)
+        nonce = secrets.token_bytes(12)
+        wrapped = public_key.encrypt(aes_key, padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+        Path('sealed').mkdir(exist_ok=True)
+        Path('sealed/reports.enc').write_bytes(b'ASC1' + len(wrapped).to_bytes(2, 'big') + wrapped + nonce + AESGCM(aes_key).encrypt(nonce, buffer.getvalue(), b'ASC1'))
+
+        PYTHON
+    - name: Save encrypted report archive only
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-store-analytics-${{ github.run_id }}
+        path: sealed/reports.enc
+        if-no-files-found: error
+        retention-days: 3
